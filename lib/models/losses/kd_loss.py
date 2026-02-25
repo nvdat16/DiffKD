@@ -21,10 +21,11 @@ KD_MODULES = {
     'tv_resnet34': dict(modules=['layer4', 'fc'], channels=[512, 1000]),
     'tv_resnet18': dict(modules=['layer4', 'fc'], channels=[512, 1000]),
     'resnet18': dict(modules=['layer4', 'fc'], channels=[512, 1000]),
+    'resnet34': dict(modules=['layer4', 'fc'], channels=[512, 10]),
     'tv_mobilenet_v2': dict(modules=['features.18', 'classifier'], channels=[1280, 1000]),
     'nas_model': dict(modules=['features.conv_out', 'classifier'], channels=[1280, 1000]),  # mbv2
     'timm_tf_efficientnet_b0': dict(modules=['conv_head', 'classifier'], channels=[1280, 1000]),
-    'mobilenet_v1': dict(modules=['model.13', 'fc'], channels=[1024, 1000]),
+    'mobilenet_v1': dict(modules=['model.13', 'fc'], channels=[1024, 10]),
     'timm_swin_large_patch4_window7_224': dict(modules=['norm', 'head'], channels=[1536, 1000]),
     'timm_swin_tiny_patch4_window7_224': dict(modules=['norm', 'head'], channels=[768, 1000]),
 }
