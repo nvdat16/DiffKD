@@ -6,6 +6,7 @@ import time
 import random
 import numpy as np
 from torch.nn.parallel import DistributedDataParallel as DDP
+from torchinfo import summary
 
 from lib.models.builder import build_model
 from lib.models.losses import CrossEntropyLabelSmooth, \
@@ -76,38 +77,40 @@ def main():
     val_loss_fn = loss_fn
 
     model = build_model(args, args.model)
-    logger.info(
-        f'Model {args.model} created, params: {get_params(model) / 1e6:.3f} M, '
-        f'FLOPs: {get_flops(model, input_shape=args.input_shape) / 1e9:.3f} G')
-
-    # logger.info(
-    #     f'Model {args.model} created, params: {get_params(model) / 1e6:.3f} M')
-
+    
     # Diverse Branch Blocks
     if args.dbb:
-        # convert 3x3 convs to dbb blocks
         from lib.models.utils.dbb_converter import convert_to_dbb
         convert_to_dbb(model)
-        logger.info(model)
-        logger.info(
-            f'Converted to DBB blocks, model params: {get_params(model) / 1e6:.3f} M, '
-            f'FLOPs: {get_flops(model, input_shape=args.input_shape) / 1e9:.3f} G')
+        logger.info('Converted to DBB blocks.')
 
     model.cuda()
-    
+
+    # In model summary bằng torchinfo (Chỉ in ở Rank 0)
+    if args.rank == 0:
+        logger.info("Generating Model Summary...")
+        # Giả sử args.input_shape có dạng [C, H, W], ta thêm Batch size vào đầu
+        input_size = (args.batch_size, *args.input_shape)
+        model_stats = summary(
+            model, 
+            input_size=input_size, 
+        )
+        logger.info(f"\n{str(model_stats)}")
 
     # knowledge distillation
     if args.kd != '':
-        # build teacher model
         teacher_model = build_model(args, args.teacher_model, args.teacher_pretrained, args.teacher_ckpt)
-        logger.info(
-            f'Teacher model {args.teacher_model} created, params: {get_params(teacher_model) / 1e6:.3f} M, '
-            f'FLOPs: {get_flops(teacher_model, input_shape=args.input_shape) / 1e9:.3f} G')
         teacher_model.cuda()
+        if args.rank == 0:
+            logger.info(f"=== Teacher Model Summary: {args.teacher_model} ===")
+            teacher_stats = summary(
+                teacher_model, 
+                input_size=(args.batch_size, *args.input_shape),
+            )
+            logger.info(f"\n{str(teacher_stats)}\n")
         test_metrics = validate(args, 0, teacher_model, val_loader, val_loss_fn, log_suffix=' (teacher)')
         logger.info(f'Top-1 accuracy of teacher model {args.teacher_model}: {test_metrics["top1"]:.2f}')
 
-        # build kd loss
         from lib.models.losses.kd_loss import KDLoss
         loss_fn = KDLoss(model, teacher_model, args.model, args.teacher_model, loss_fn, 
                          args.kd, args.ori_loss_weight, args.kd_loss_weight, args.kd_loss_kwargs)
@@ -115,11 +118,12 @@ def main():
     model = DDP(model,
                 device_ids=[args.local_rank],
                 find_unused_parameters=False)
+    
     from torch.distributed.algorithms.ddp_comm_hooks import default as comm_hooks
     model.register_comm_hook(None, comm_hooks.fp16_compress_hook)
+    
     if args.kd != '':
         loss_fn.student = model
-    logger.info(model)
 
     if args.model_ema:
         model_ema = ModelEMA(model, decay=args.model_ema_decay)
@@ -211,17 +215,14 @@ def main():
         train_loader.loader.sampler.set_epoch(epoch)
 
         if args.drop_path_rate > 0. and args.drop_path_strategy == 'linear':
-            # update drop path rate
             if hasattr(model.module, 'drop_path_rate'):
                 model.module.drop_path_rate = \
                     args.drop_path_rate * epoch / args.epochs
 
-        # train
         metrics = train_epoch(args, epoch, model, model_ema, train_loader,
                               optimizer, loss_fn, scheduler, auxiliary_buffer,
                               dyrep, loss_scaler)
 
-        # validate
         test_metrics = validate(args, epoch, model, val_loader, val_loss_fn)
         if model_ema is not None:
             test_metrics = validate(args,
@@ -231,17 +232,16 @@ def main():
                                     val_loss_fn,
                                     log_suffix='(EMA)')
 
-        # dyrep
         if dyrep is not None:
             if epoch < args.dyrep_max_adjust_epochs:
                 if (epoch + 1) % args.dyrep_adjust_interval == 0:
-                    # adjust
                     logger.info('DyRep: adjust model.')
                     dyrep.adjust_model()
-                    logger.info(
-                        f'Model params: {get_params(model)/1e6:.3f} M, FLOPs: {get_flops(model, input_shape=args.input_shape)/1e9:.3f} G'
-                    )
-                    # re-init DDP
+                    
+                    if args.rank == 0:
+                        stats = summary(model.module, input_size=(args.batch_size, *args.input_shape), verbose=0)
+                        logger.info(f"\nModel after DyRep Adjust:\n{stats}")
+
                     model = DDP(model.module,
                                 device_ids=[args.local_rank],
                                 find_unused_parameters=True)
@@ -279,8 +279,6 @@ def train_epoch(args,
         data_time = time.time() - start_time
         data_time_m.update(data_time)
 
-        # optimizer.zero_grad()
-        # use optimizer.zero_grad(set_to_none=True) for speedup
         for p in model.parameters():
             p.grad = None
 
@@ -298,8 +296,8 @@ def train_epoch(args,
         if loss_scaler is None:
             loss.backward()
         else:
-            # amp
             loss_scaler.scale(loss).backward()
+            
         if args.clip_grad_norm:
             if loss_scaler is not None:
                 loss_scaler.unscale_(optimizer)
@@ -307,7 +305,6 @@ def train_epoch(args,
                                            args.clip_grad_max_norm)
 
         if dyrep is not None:
-            # record states of model in dyrep
             dyrep.record_metrics()
             
         if loss_scaler is None:
@@ -322,6 +319,7 @@ def train_epoch(args,
         loss_m.update(loss.item(), n=input.size(0))
         batch_time = time.time() - start_time
         batch_time_m.update(batch_time)
+        
         if batch_idx % args.log_interval == 0 or batch_idx == len(loader) - 1:
             if _has_nvidia_smi:
                 util = int(nvidia_smi.nvmlDeviceGetUtilizationRates(handle).gpu)
@@ -333,13 +331,10 @@ def train_epoch(args,
                             'Util: {util:d}% '
                             'Time: {batch_time.val:.2f}s ({batch_time.avg:.2f}s) '
                             'Data: {data_time.val:.2f}s'.format(
-                                epoch,
-                                batch_idx,
-                                len(loader),
+                                epoch, batch_idx, len(loader),
                                 loss=loss_m,
                                 lr=optimizer.param_groups[0]['lr'],
-                                util=util,
-                                memory=mem,
+                                util=util, memory=mem,
                                 batch_time=batch_time_m,
                                 data_time=data_time_m))
             else:
@@ -349,9 +344,7 @@ def train_epoch(args,
                             'Mem: {memory:.0f} '
                             'Time: {batch_time.val:.2f}s ({batch_time.avg:.2f}s) '
                             'Data: {data_time.val:.2f}s'.format(
-                                epoch,
-                                batch_idx,
-                                len(loader),
+                                epoch, batch_idx, len(loader),
                                 loss=loss_m,
                                 lr=optimizer.param_groups[0]['lr'],
                                 memory=torch.cuda.max_memory_allocated() / 1024.0 / 1024.0,
@@ -389,13 +382,8 @@ def validate(args, epoch, model, loader, loss_fn, log_suffix=''):
                         'Top-1: {top1.val:.3f}% ({top1.avg:.3f}%) '
                         'Top-5: {top5.val:.3f}% ({top5.avg:.3f}%) '
                         'Time: {batch_time.val:.2f}s'.format(
-                            log_suffix,
-                            epoch,
-                            batch_idx,
-                            len(loader),
-                            loss=loss_m,
-                            top1=top1_m,
-                            top5=top5_m,
+                            log_suffix, epoch, batch_idx, len(loader),
+                            loss=loss_m, top1=top1_m, top5=top5_m,
                             batch_time=batch_time_m))
         start_time = time.time()
 
