@@ -116,6 +116,18 @@ def main():
         from lib.models.losses.kd_loss import KDLoss
         loss_fn = KDLoss(model, teacher_model, args.model, args.teacher_model, loss_fn, 
                          args.kd, args.ori_loss_weight, args.kd_loss_weight, args.kd_loss_kwargs)
+        if args.rank == 0:
+            logger.info("=== DIFFKD FULL PIPELINE SUMMARY (Student + Teacher + KD Modules) ===")
+            # Lưu ý: DiffKD thường nhận input là hình ảnh để qua cả 2 model
+            try:
+                kd_stats = summary(
+                    loss_fn, 
+                    input_size=(args.batch_size, *args.input_shape),
+                    verbose=0
+                )
+                logger.info(f"\n{kd_stats}")
+            except Exception as e:
+                logger.warning(f"Could not summary KDLoss wrapper: {e}")
 
     model = DDP(model,
                 device_ids=[args.local_rank],
