@@ -94,6 +94,7 @@ def main():
         model_stats = summary(
             model, 
             input_size=input_size, 
+            verbose=0
         )
         logger.info(f"\n{str(model_stats)}")
 
@@ -106,6 +107,7 @@ def main():
             teacher_stats = summary(
                 teacher_model, 
                 input_size=(args.batch_size, *args.input_shape),
+                verbose=0
             )
             logger.info(f"\n{str(teacher_stats)}\n")
         test_metrics = validate(args, 0, teacher_model, val_loader, val_loss_fn, log_suffix=' (teacher)')
